@@ -378,6 +378,10 @@ class Params:
     buffer_frac: float = 0.0005      # crypto: same, as a fraction of price
     min_risk_pips: float = 5.0       # forex: skip trades whose stop is tighter than this (spread eats them)
     spread_pips: float = 0.0         # backtest cost per trade
+    stop_mode: str = "skip"          # "skip": drop trades whose stop is under min_risk; "widen": push the stop out to min_risk
+    target_mode: str = "rr"          # "rr": entry +/- rr * risk; "pool": nearest 15m swing high/low (next liquidity pool)
+    min_rr: float = 1.5              # pool target: skip the trade if it pays less than this
+    pool_lookback: int = 96          # 15m candles (24h) searched for swing pools
     strict_body: bool = True
     max_trades_per_day: int = 1
 
@@ -429,6 +433,17 @@ def find_ifvg_entry(c5, i0, i1, direction, sweep_t, p):
     return None
 
 
+def next_pool(c15, t15, entry_t, entry, direction, p):
+    """Nearest confirmed 15m swing high above (long) / swing low below (short) the entry, last 24h. None if none."""
+    k1 = bisect_left(t15, entry_t + 5 * MIN - 15 * MIN) + 1          # 15m candles complete by the entry candle's close
+    win = c15[max(0, k1 - p.pool_lookback):k1]
+    if direction == BULL:
+        lv = [win[i].h for i in swing_highs(win) if win[i].h > entry]
+        return min(lv) if lv else None
+    lv = [win[i].l for i in swing_lows(win) if win[i].l < entry]
+    return max(lv) if lv else None
+
+
 def find_setups(c15, c5, day_start, day_end, direction, p, after=0):
     """Setups for one trading day, earliest first. direction = locked daily bias."""
     if direction == 0:
@@ -448,9 +463,19 @@ def find_setups(c15, c5, day_start, day_end, direction, p, after=0):
         entry, buf = c.c, p.buffer(c.c)
         stop = extreme - buf if direction == BULL else extreme + buf
         risk = (entry - stop) * direction
-        if risk <= 0 or risk < p.min_risk():
+        if risk <= 0:
             continue
-        out.append(Setup(direction, c.t, entry, stop, entry + direction * p.rr * risk, extreme, sweep_t, z))
+        if risk < p.min_risk():
+            if p.stop_mode != "widen":
+                continue
+            risk = p.min_risk(); stop = entry - direction * risk
+        if p.target_mode == "pool":
+            target = next_pool(c15, t15, c.t, entry, direction, p)
+            if target is None or (target - entry) * direction < p.min_rr * risk:
+                continue
+        else:
+            target = entry + direction * p.rr * risk
+        out.append(Setup(direction, c.t, entry, stop, target, extreme, sweep_t, z))
         last_entry_t = c.t
     out.sort(key=lambda s: s.entry_t)
     return out
@@ -482,7 +507,8 @@ def backtest(daily, h4, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.
     """
     variants = list(METHODS) + ["combined"]
     gated = [v + "+sma20" for v in variants if v != "D_sma20"]      # bias kept only if it agrees with the trend
-    stats = {v: dict(bias_days=0, bias_right=0, trades=0, wins=0, r=0.0) for v in variants + gated}
+    diag = ["diag_either", "diag_hindsight"]                         # entry-only diagnostics, not tradable biases
+    stats = {v: dict(bias_days=0, bias_right=0, trades=0, wins=0, r=0.0) for v in variants + gated + diag}
     log, t5 = [], [c.t for c in c5]
     for i in range(warmup, len(daily)):
         today = daily[i]
@@ -510,6 +536,12 @@ def backtest(daily, h4, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.
                 s["trades"] += 1; s["wins"] += r > 0; s["r"] += r
                 if v == "combined":
                     log.append((datetime.fromtimestamp(su.entry_t / 1000, UTC), b, su.entry, su.stop, su.target, why, r))
+        for name, dirs in (("diag_either", (BULL, BEAR)), ("diag_hindsight", (actual,))):
+            ss = sorted((x for d_ in dirs for x in find_setups(c15, c5, today.t, end, d_, p, after=lock_t)), key=lambda x: x.entry_t)
+            if ss:
+                su = ss[0]; r, _ = simulate(su, c5, end)
+                r -= fee_r + p.spread_pips * p.pip / ((su.entry - su.stop) * su.direction)
+                st = stats[name]; st["trades"] += 1; st["wins"] += r > 0; st["r"] += r
     return stats, log
 
 
@@ -538,7 +570,8 @@ def make_params(a):
         kz = tuple(tuple(float(x) for x in z.split("-")) for z in a.killzones.split(",")) if a.killzones else ()
         m = Market(m.name, m.tz, m.anchor_hour, kz, m.min_candles, m.lock_offset)
     p = Params(market=m, rr=a.rr, pip=a.pip or pip_size(a.symbol), spread_pips=a.spread_pips,
-               strict_body=not a.loose_body, min_risk_pips=a.min_risk_pips)
+               strict_body=not a.loose_body, min_risk_pips=a.min_risk_pips,
+               stop_mode=a.stop_mode, target_mode=a.target, min_rr=a.min_rr)
     return p
 
 
@@ -593,6 +626,9 @@ def main():
         sp.add_argument("--rr", type=float, default=3.0)
         sp.add_argument("--spread-pips", type=float, default=0.0)
         sp.add_argument("--min-risk-pips", type=float, default=5.0)
+        sp.add_argument("--stop-mode", choices=["skip", "widen"], default="skip", help="stops tighter than --min-risk-pips: skip the trade or widen the stop")
+        sp.add_argument("--target", choices=["rr", "pool"], default="rr", help="rr = fixed R multiple; pool = nearest 15m swing high/low")
+        sp.add_argument("--min-rr", type=float, default=1.5, help="pool target: skip if it pays less than this many R")
         sp.add_argument("--killzones", default=None, help="NY-time windows e.g. '2-5,7-10'; '' disables")
         sp.add_argument("--lock-offset", type=int, default=None, help="hours after the day opens to lock bias (forex default 9 = 02:00 NY; 0 = at the open)")
         sp.add_argument("--loose-body", action="store_true", help="IFVG needs only a close beyond the gap")
