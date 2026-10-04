@@ -381,6 +381,7 @@ class Params:
     stop_mode: str = "skip"          # "skip": drop trades whose stop is under min_risk; "widen": push the stop out to min_risk
     target_mode: str = "rr"          # "rr": entry +/- rr * risk; "pool": nearest 15m swing high/low (next liquidity pool)
     min_rr: float = 1.5              # pool target: skip the trade if it pays less than this
+    breakeven_r: float = 0.0         # >0: once price reaches +this many R, move the stop to entry
     pool_lookback: int = 96          # 15m candles (24h) searched for swing pools
     strict_body: bool = True
     max_trades_per_day: int = 1
@@ -481,18 +482,21 @@ def find_setups(c15, c5, day_start, day_end, direction, p, after=0):
     return out
 
 
-def simulate(setup, c5, day_end):
+def simulate(setup, c5, day_end, be_r=0.0):
     """(R multiple before costs, reason). Same-candle SL+TP -> SL. Open trades close at the day's end."""
     d, risk, last = setup.direction, (setup.entry - setup.stop) * setup.direction, None
     t5 = [c.t for c in c5]
+    stop, moved = setup.stop, False
     for c in c5[bisect_left(t5, setup.entry_t + 5 * MIN):]:
         if c.t >= day_end:
             break
         last = c
-        if (c.l <= setup.stop) if d == BULL else (c.h >= setup.stop):
-            return -1.0, "SL"
+        if (c.l <= stop) if d == BULL else (c.h >= stop):
+            return (0.0, "BE") if moved else (-1.0, "SL")
         if (c.h >= setup.target) if d == BULL else (c.l <= setup.target):
             return (setup.target - setup.entry) * d / risk, "TP"
+        if be_r and not moved and ((c.h - setup.entry) * d >= be_r * risk if d == BULL else (setup.entry - c.l) >= be_r * risk):
+            stop, moved = setup.entry, True                  # takes effect from the next candle
     if last is None:
         return 0.0, "NOFILL"
     return (last.c - setup.entry) * d / risk, "EOD"
@@ -531,7 +535,7 @@ def backtest(daily, h4, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.
                 continue
             s["bias_days"] += 1; s["bias_right"] += (b == actual)
             for su in find_setups(c15, c5, today.t, end, b, p, after=lock_t)[: p.max_trades_per_day]:
-                r, why = simulate(su, c5, end)
+                r, why = simulate(su, c5, end, p.breakeven_r)
                 r -= fee_r + p.spread_pips * p.pip / ((su.entry - su.stop) * su.direction)
                 s["trades"] += 1; s["wins"] += r > 0; s["r"] += r
                 if v == "combined":
@@ -539,7 +543,7 @@ def backtest(daily, h4, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.
         for name, dirs in (("diag_either", (BULL, BEAR)), ("diag_hindsight", (actual,))):
             ss = sorted((x for d_ in dirs for x in find_setups(c15, c5, today.t, end, d_, p, after=lock_t)), key=lambda x: x.entry_t)
             if ss:
-                su = ss[0]; r, _ = simulate(su, c5, end)
+                su = ss[0]; r, _ = simulate(su, c5, end, p.breakeven_r)
                 r -= fee_r + p.spread_pips * p.pip / ((su.entry - su.stop) * su.direction)
                 st = stats[name]; st["trades"] += 1; st["wins"] += r > 0; st["r"] += r
     return stats, log
@@ -571,7 +575,7 @@ def make_params(a):
         m = Market(m.name, m.tz, m.anchor_hour, kz, m.min_candles, m.lock_offset)
     p = Params(market=m, rr=a.rr, pip=a.pip or pip_size(a.symbol), spread_pips=a.spread_pips,
                strict_body=not a.loose_body, min_risk_pips=a.min_risk_pips,
-               stop_mode=a.stop_mode, target_mode=a.target, min_rr=a.min_rr)
+               stop_mode=a.stop_mode, target_mode=a.target, min_rr=a.min_rr, breakeven_r=a.breakeven_r)
     return p
 
 
@@ -628,6 +632,7 @@ def main():
         sp.add_argument("--min-risk-pips", type=float, default=5.0)
         sp.add_argument("--stop-mode", choices=["skip", "widen"], default="skip", help="stops tighter than --min-risk-pips: skip the trade or widen the stop")
         sp.add_argument("--target", choices=["rr", "pool"], default="rr", help="rr = fixed R multiple; pool = nearest 15m swing high/low")
+        sp.add_argument("--breakeven-r", type=float, default=0.0, help="move the stop to entry once price reaches this many R (0 = off)")
         sp.add_argument("--min-rr", type=float, default=1.5, help="pool target: skip if it pays less than this many R")
         sp.add_argument("--killzones", default=None, help="NY-time windows e.g. '2-5,7-10'; '' disables")
         sp.add_argument("--lock-offset", type=int, default=None, help="hours after the day opens to lock bias (forex default 9 = 02:00 NY; 0 = at the open)")
