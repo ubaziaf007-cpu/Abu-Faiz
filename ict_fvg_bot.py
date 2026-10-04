@@ -144,10 +144,15 @@ def load_csv(path):
         ts = " ".join(r[i].strip() for i in tcols)
         out.append(Candle(_parse_time(ts), float(r[col["open"]]), float(r[col["high"]]), float(r[col["low"]]), float(r[col["close"]])))
     out.sort(key=lambda c: c.t)
+    if len(out) > 10 and sorted(b.t - a.t for a, b in zip(out, out[1:]))[len(out) // 2] == MIN:   # 1m export -> 5m
+        out = resample(out, lambda t: t - t % (5 * MIN))
     return out
 
 
 def _parse_time(s):
+    s = s.strip()
+    if s.endswith("+00:00"):
+        s = s[:-6]
     if s.replace(".", "", 1).isdigit() and "." not in s[:5]:
         v = float(s)
         return int(v if v > 1e11 else v * 1000)
@@ -542,6 +547,7 @@ def main():
     b.add_argument("--csv", help="5m CSV (MT5/broker export, UTC); skips the network")
     b.add_argument("--start", required=True); b.add_argument("--end", required=True)
     b.add_argument("--fee-r", type=float, default=0.0)
+    b.add_argument("--warmup", type=int, default=12, help="days of history before the first traded day")
     s = sub.add_parser("signal"); common(s)
     l = sub.add_parser("live"); common(l)
     l.add_argument("--execute", action="store_true", help="place orders (default: log signals only)")
@@ -558,7 +564,7 @@ def main():
         else:
             c5 = get_broker(a).fetch_5m(a.symbol, s0 - 45 * 24 * HOUR, e0)
         c5 = [c for c in c5 if c.t < e0 + 2 * 24 * HOUR]
-        stats, log = backtest(to_daily(c5, p.market), to_15m(c5), c5, p, start_ms=s0, end_ms=e0, fee_r=a.fee_r)
+        stats, log = backtest(to_daily(c5, p.market), to_15m(c5), c5, p, start_ms=s0, end_ms=e0, warmup=a.warmup, fee_r=a.fee_r)
         print(f"{a.symbol} {a.start}..{a.end} market={a.market} pip={p.pip} spread={p.spread_pips}p "
               f"killzones={p.market.killzones or 'off'} strict_body={p.strict_body} candles5m={len(c5)}")
         print_report(stats, log)
