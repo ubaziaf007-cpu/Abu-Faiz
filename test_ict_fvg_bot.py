@@ -1,5 +1,7 @@
-import unittest
+import unittest, tempfile, os
 from ict_fvg_bot import *
+
+DAY = 86_400_000
 
 
 def C(t, o, h, l, c):
@@ -58,21 +60,68 @@ class Tests(unittest.TestCase):
         add(97.2, 97.3, 96.5, 96.7)
         add(96.7, 97.0, 95.9, 97.0)                                # retest zone high 96, rejection: close>96, close>open
         for _ in range(20): add(97, 97.5, 96.9, 97.2)
-        p = Params(sweep_lookback=24)
-        su = find_setups(c15, c5, day, BULL, p)
+        p = Params(market=CRYPTO, sweep_lookback=24, pip=0.0001)
+        su = find_setups(c15, c5, day, day + DAY, BULL, p)
         self.assertEqual(len(su), 1)
         s = su[0]
         self.assertEqual(s.entry, 97.0)
         self.assertLess(s.stop, 95)
         self.assertAlmostEqual((s.target - s.entry) / (s.entry - s.stop), 3.0)
-        self.assertEqual(find_setups(c15, c5, day, BEAR, p), [])   # never against bias
-        self.assertEqual(find_setups(c15, c5, day, 0, p), [])
+        self.assertEqual(find_setups(c15, c5, day, day + DAY, BEAR, p), [])   # never against bias
+        self.assertEqual(find_setups(c15, c5, day, day + DAY, 0, p), [])
 
     def test_simulate(self):
         s = Setup(BULL, 0, 100, 98, 106, 98.5, 0)
         mk = lambda hi, lo: [C(5 * MIN, 100, hi, lo, 100)]
         self.assertEqual(simulate(s, mk(107, 99), DAY), (3.0, "TP"))
         self.assertEqual(simulate(s, mk(107, 97), DAY)[1], "SL")
+
+    def test_forex_day_boundaries(self):
+        u = lambda *a: int(datetime(*a, tzinfo=UTC).timestamp() * 1000)
+        # winter: NY day opens 17:00 EST = 22:00Z; Monday midday belongs to the day opened Sunday
+        self.assertEqual(FOREX.day_start(u(2026, 1, 12, 12)), u(2026, 1, 11, 22))
+        # summer: 17:00 EDT = 21:00Z
+        self.assertEqual(FOREX.day_start(u(2026, 7, 14, 12)), u(2026, 7, 13, 21))
+        # the instant of the open starts the new day, one ms before belongs to the old one
+        self.assertEqual(FOREX.day_start(u(2026, 1, 12, 22)), u(2026, 1, 12, 22))
+        self.assertEqual(FOREX.day_start(u(2026, 1, 12, 22) - 1), u(2026, 1, 11, 22))
+        # DST spring-forward day is 23h long
+        st = u(2026, 3, 7, 22)
+        self.assertEqual(FOREX.day_end(st) - st, 23 * HOUR)
+
+    def test_killzone(self):
+        u = lambda *a: int(datetime(*a, tzinfo=UTC).timestamp() * 1000)
+        self.assertTrue(FOREX.in_killzone(u(2026, 1, 12, 8)))     # 03:00 NY
+        self.assertFalse(FOREX.in_killzone(u(2026, 1, 12, 11)))   # 06:00 NY
+        self.assertTrue(FOREX.in_killzone(u(2026, 1, 12, 13)))    # 08:00 NY
+        self.assertTrue(CRYPTO.in_killzone(u(2026, 1, 12, 11)))
+
+    def test_weekend_dropped_and_resample(self):
+        u = lambda *a: int(datetime(*a, tzinfo=UTC).timestamp() * 1000)
+        c5 = []
+        t = u(2026, 1, 12, 22)                       # Monday-session day start
+        for k in range(288):
+            c5.append(C(t + k * 5 * MIN, 1, 2, 0.5, 1.5))
+        c5.append(C(u(2026, 1, 16, 22) + 5 * 60 * 60_000 * 0, 1, 1, 1, 1))   # lone Friday-evening stub
+        d = to_daily(c5, FOREX)
+        self.assertEqual(len(d), 1)
+        m15 = to_15m(c5[:7])
+        self.assertEqual(len(m15), 3)                 # 7 candles -> buckets of 3,3,1
+        self.assertEqual(len(to_15m(c5[:7], until=c5[6].t + 5 * MIN)), 2)  # forming bucket dropped
+
+    def test_csv_mt5_and_forex_costs(self):
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, "m5.csv")
+        open(f, "w").write("<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\n2026.01.12\t10:05\t1.1\t1.2\t1.0\t1.15\n2026.01.12\t10:00\t1.0\t1.1\t0.9\t1.1\n")
+        cs = load_csv(f)
+        self.assertEqual([c.c for c in cs], [1.1, 1.15])
+        self.assertEqual(cs[0].t, int(datetime(2026, 1, 12, 10, tzinfo=UTC).timestamp() * 1000))
+        self.assertEqual(pip_size("USD_JPY"), 0.01)
+        self.assertEqual(pip_size("EUR_USD"), 0.0001)
+        # forex stop buffer = pips, min-risk filter
+        p = Params(market=FOREX, pip=0.0001)
+        self.assertAlmostEqual(p.buffer(1.1), 0.0002)
+        self.assertAlmostEqual(p.min_risk(), 0.0005)
 
 
 if __name__ == "__main__":
