@@ -46,6 +46,7 @@ class Market:
     anchor_hour: int                      # local hour at which the trading day starts
     killzones: tuple = ()                 # ((start_hr, end_hr), ...) New York time; () = always allowed
     min_candles: int = 100                # 5m candles for a day to count (skips weekends/holidays)
+    lock_offset: int = 0                  # hours after the day opens at which the bias is locked
 
     def day_start(self, t):
         local = datetime.fromtimestamp(t / 1000, self.tz)
@@ -56,6 +57,10 @@ class Market:
         d = datetime.fromtimestamp(start / 1000, self.tz).date() + timedelta(days=1)
         return int(datetime(d.year, d.month, d.day, self.anchor_hour, tzinfo=self.tz).timestamp() * 1000)
 
+    def lock_time(self, start):
+        """Bias lock instant: `lock_offset` wall-clock hours after the day opens (DST-safe)."""
+        return int((datetime.fromtimestamp(start / 1000, self.tz) + timedelta(hours=self.lock_offset)).timestamp() * 1000)
+
     def in_killzone(self, t):
         if not self.killzones:
             return True
@@ -64,7 +69,7 @@ class Market:
         return any(a <= x < b for a, b in self.killzones)
 
 
-FOREX = Market("forex", NY, 17, killzones=((2, 5), (7, 10)))   # London + New York AM
+FOREX = Market("forex", NY, 17, killzones=((2, 5), (7, 10)), lock_offset=9)   # lock 02:00 NY (London open)
 CRYPTO = Market("crypto", UTC, 0)
 MARKETS = {"forex": FOREX, "crypto": CRYPTO}
 
@@ -100,6 +105,14 @@ def resample(cs, key_fn, end_fn=None, until=None):
 
 def to_15m(c5, until=None):
     return resample(c5, lambda t: t - t % (15 * MIN), lambda k: k + 15 * MIN, until)
+
+
+def to_h4(c5, market, until=None):
+    """4H candles aligned to the market's day open (forex: 17,21,01,05,09,13 NY)."""
+    def key(t):
+        ds = market.day_start(t)
+        return ds + (t - ds) // (4 * HOUR) * 4 * HOUR
+    return resample(c5, key, lambda k: k + 4 * HOUR, until)
 
 
 def to_daily(c5, market, until=None):
@@ -298,19 +311,38 @@ def vote_sweep(d, lookback=5):
     return 0
 
 
-METHODS = {"A_pdh_pdl": lambda d, p: vote_pdh_pdl(d, p),
-           "B_structure": lambda d, p: vote_structure(d),
-           "C_sweep": lambda d, p: vote_sweep(d)}
+# Votes take (daily history, 4H history, price at lock). COMBINED are the methods summed for the bias;
+# B_structure_1d is reported for comparison only.
+METHODS = {"A_pdh_pdl": lambda d, h, p: vote_pdh_pdl(d, p),
+           "B_structure_4h": lambda d, h, p: vote_structure(h),
+           "B_structure_1d": lambda d, h, p: vote_structure(d),
+           "C_sweep": lambda d, h, p: vote_sweep(d)}
+COMBINED = ("A_pdh_pdl", "B_structure_4h", "C_sweep")
 
 
-def daily_bias_votes(d, price):
-    return {k: f(d, price) for k, f in METHODS.items()}
+def daily_bias_votes(d, price, h4=None):
+    return {k: f(d, h4 if h4 is not None else d, price) for k, f in METHODS.items()}
 
 
-def daily_bias(d, price, min_score=2):
-    """d = completed daily candles (d[-1] = previous day); price = price at the day's open."""
-    score = sum(daily_bias_votes(d, price).values())
+def bias_from_votes(votes, min_score=2):
+    score = sum(votes[k] for k in COMBINED)
     return BULL if score >= min_score else BEAR if score <= -min_score else 0
+
+
+def lock_bias(daily, h4_all, c5, ds, p):
+    """Bias for the day opening at ds, using only data before the lock instant. None if no price at lock."""
+    lock_t = p.market.lock_time(ds)
+    t5 = [c.t for c in c5]
+    i = bisect_left(t5, lock_t) - 1                       # last 5m candle that closed by the lock
+    if i < 0 or c5[i].t < lock_t - 30 * MIN or c5[i].t < ds:
+        if p.market.lock_offset or bisect_left(t5, lock_t) >= len(c5) or c5[bisect_left(t5, lock_t)].t > lock_t + 30 * MIN:
+            return None
+        i = bisect_left(t5, lock_t)                       # lock at the open: price = first candle's open
+        votes = daily_bias_votes(daily, c5[i].o, [c for c in h4_all if c.t + 4 * HOUR <= lock_t])
+        return bias_from_votes(votes), votes, lock_t
+    h4 = h4_all[:bisect_left([c.t for c in h4_all], lock_t - 4 * HOUR + 1)]   # H4 candles completed by lock
+    votes = daily_bias_votes(daily, c5[i].c, h4)
+    return bias_from_votes(votes), votes, lock_t
 
 
 # ----------------------------------------------------- 15m sweep -> 5m IFVG entry
@@ -388,12 +420,12 @@ def find_ifvg_entry(c5, i0, i1, direction, sweep_t, p):
     return None
 
 
-def find_setups(c15, c5, day_start, day_end, direction, p):
+def find_setups(c15, c5, day_start, day_end, direction, p, after=0):
     """Setups for one trading day, earliest first. direction = locked daily bias."""
     if direction == 0:
         return []
     t15, t5 = [c.t for c in c15], [c.t for c in c5]
-    k0, k1 = bisect_left(t15, day_start), bisect_left(t15, day_end)
+    k0, k1 = bisect_left(t15, max(day_start, after)), bisect_left(t15, day_end)
     i_end = bisect_left(t5, day_end)
     out, last_entry_t = [], -1
     for k, lvl, extreme in find_sweeps(c15, k0, k1, direction, p):
@@ -433,26 +465,33 @@ def simulate(setup, c5, day_end):
 
 
 # ----------------------------------------------------------------------- backtest
-def backtest(daily, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.0):
-    """Same pipeline gated by each bias method alone and by the combined score."""
+def backtest(daily, h4, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.0):
+    """Same pipeline gated by each bias method alone and by the combined score.
+
+    Bias is locked at market.lock_time() from data before that instant only; setups must come after it.
+    'dir acc' = did price move in the bias direction from the lock price to the day's close.
+    """
     variants = list(METHODS) + ["combined"]
     stats = {v: dict(bias_days=0, bias_right=0, trades=0, wins=0, r=0.0) for v in variants}
-    log = []
+    log, t5 = [], [c.t for c in c5]
     for i in range(warmup, len(daily)):
         today = daily[i]
         if today.t < start_ms or (end_ms and today.t >= end_ms):
             continue
         end = p.market.day_end(today.t)
-        hist, price = daily[:i], today.o                 # bias locked at the day's open
-        votes = daily_bias_votes(hist, price)
-        biases = dict(votes, combined=daily_bias(hist, price))
-        actual = BULL if today.c > today.o else BEAR
+        lk = lock_bias(daily[:i], h4, c5, today.t, p)
+        if lk is None:
+            continue
+        comb, votes, lock_t = lk
+        j = bisect_left(t5, lock_t) - 1
+        actual = BULL if today.c > c5[j].c else BEAR
+        biases = dict(votes, combined=comb)
         for v in variants:
             b, s = biases[v], stats[v]
             if b == 0:
                 continue
             s["bias_days"] += 1; s["bias_right"] += (b == actual)
-            for su in find_setups(c15, c5, today.t, end, b, p)[: p.max_trades_per_day]:
+            for su in find_setups(c15, c5, today.t, end, b, p, after=lock_t)[: p.max_trades_per_day]:
                 r, why = simulate(su, c5, end)
                 r -= fee_r + p.spread_pips * p.pip / ((su.entry - su.stop) * su.direction)
                 s["trades"] += 1; s["wins"] += r > 0; s["r"] += r
@@ -462,12 +501,12 @@ def backtest(daily, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.0):
 
 
 def print_report(stats, log):
-    print(f"{'bias method':<14}{'bias days':>10}{'dir acc':>9}{'trades':>8}{'win%':>7}{'total R':>9}{'avg R':>8}")
+    print(f"{'bias method':<16}{'bias days':>10}{'dir acc':>9}{'trades':>8}{'win%':>7}{'total R':>9}{'avg R':>8}")
     for v, s in stats.items():
         acc = s["bias_right"] / s["bias_days"] * 100 if s["bias_days"] else 0
         wr = s["wins"] / s["trades"] * 100 if s["trades"] else 0
         avg = s["r"] / s["trades"] if s["trades"] else 0
-        print(f"{v:<14}{s['bias_days']:>10}{acc:>8.1f}%{s['trades']:>8}{wr:>6.1f}%{s['r']:>9.2f}{avg:>8.2f}")
+        print(f"{v:<16}{s['bias_days']:>10}{acc:>8.1f}%{s['trades']:>8}{wr:>6.1f}%{s['r']:>9.2f}{avg:>8.2f}")
     print("\ncombined-score trades (UTC):")
     for t, b, e, sl, tp, why, r in log:
         print(f"  {t:%Y-%m-%d %H:%M} {'LONG ' if b == BULL else 'SHORT'} entry={e:.5f} sl={sl:.5f} tp={tp:.5f} {why:<5} {r:+.2f}R")
@@ -480,25 +519,27 @@ def get_broker(a):
 
 def make_params(a):
     m = MARKETS[a.market]
+    if getattr(a, 'lock_offset', None) is not None:
+        m = Market(m.name, m.tz, m.anchor_hour, m.killzones, m.min_candles, a.lock_offset)
     if a.killzones is not None:
         kz = tuple(tuple(float(x) for x in z.split("-")) for z in a.killzones.split(",")) if a.killzones else ()
-        m = Market(m.name, m.tz, m.anchor_hour, kz, m.min_candles)
+        m = Market(m.name, m.tz, m.anchor_hour, kz, m.min_candles, m.lock_offset)
     p = Params(market=m, rr=a.rr, pip=a.pip or pip_size(a.symbol), spread_pips=a.spread_pips,
                strict_body=not a.loose_body, min_risk_pips=a.min_risk_pips)
     return p
 
 
 def day_state(broker, symbol, p, now_ms):
-    """Completed-day history + today's 15m/5m candles. Returns None until today's first candle exists."""
+    """Today's context from completed candles only: (daily history, 4H, 15m, 5m, day_start)."""
     ds = p.market.day_start(now_ms)
-    hist = broker.fetch_5m(symbol, ds - 40 * 24 * HOUR, ds)
-    today = broker.fetch_5m(symbol, ds - 12 * HOUR, now_ms)
-    until = (today[-1].t + 5 * MIN) if today else None
-    c5 = [c for c in today if c.t + 5 * MIN <= now_ms]
-    first = next((c for c in c5 if c.t >= ds), None)
-    if not first:
-        return None
-    return to_daily(hist, p.market), to_15m(c5, until), c5, ds, first.o
+    raw = broker.fetch_5m(symbol, ds - 40 * 24 * HOUR, now_ms)
+    c5 = [c for c in raw if c.t + 5 * MIN <= now_ms]
+    until = c5[-1].t + 5 * MIN if c5 else None
+    daily = to_daily([c for c in c5 if c.t < ds], p.market)
+    return daily, to_h4(c5, p.market, until), to_15m(c5, until), c5, ds
+
+
+BIAS_NAME = {BULL: "BULLISH", BEAR: "BEARISH", 0: "NEUTRAL"}
 
 
 def run_live(a):
@@ -506,15 +547,15 @@ def run_live(a):
     locked, traded = {}, set()
     while True:
         now = int(time.time() * 1000)
-        ds = p.market.day_start(now)
-        st = day_state(broker, a.symbol, p, now)
-        if st:
-            daily, c15, c5, ds, day_open = st
-            if ds not in locked:
-                locked[ds] = daily_bias(daily, day_open)
-                print(f"[{datetime.fromtimestamp(ds / 1000, UTC):%Y-%m-%d %H:%M}Z] bias locked "
-                      f"{ {BULL: 'BULLISH', BEAR: 'BEARISH', 0: 'NEUTRAL'}[locked[ds]] } {daily_bias_votes(daily, day_open)}")
-            for su in find_setups(c15, c5, ds, p.market.day_end(ds), locked[ds], p)[: p.max_trades_per_day]:
+        daily, h4, c15, c5, ds = day_state(broker, a.symbol, p, now)
+        lock_t = p.market.lock_time(ds)
+        if now >= lock_t and ds not in locked:               # lock exactly once per day
+            lk = lock_bias(daily, h4, c5, ds, p)
+            if lk:
+                locked[ds] = lk[0]
+                print(f"[{datetime.fromtimestamp(lock_t / 1000, UTC):%Y-%m-%d %H:%M}Z] bias locked {BIAS_NAME[lk[0]]} {lk[1]}")
+        if ds in locked:
+            for su in find_setups(c15, c5, ds, p.market.day_end(ds), locked[ds], p, after=lock_t)[: p.max_trades_per_day]:
                 if su.entry_t in traded or su.entry_t < now - 10 * MIN:
                     continue
                 traded.add(su.entry_t)
@@ -540,6 +581,7 @@ def main():
         sp.add_argument("--spread-pips", type=float, default=0.0)
         sp.add_argument("--min-risk-pips", type=float, default=5.0)
         sp.add_argument("--killzones", default=None, help="NY-time windows e.g. '2-5,7-10'; '' disables")
+        sp.add_argument("--lock-offset", type=int, default=None, help="hours after the day opens to lock bias (forex default 9 = 02:00 NY; 0 = at the open)")
         sp.add_argument("--loose-body", action="store_true", help="IFVG needs only a close beyond the gap")
         sp.add_argument("--env", choices=["practice", "live"], default="practice", help="OANDA environment")
         sp.add_argument("--testnet", action="store_true", help="Binance testnet")
@@ -564,19 +606,18 @@ def main():
         else:
             c5 = get_broker(a).fetch_5m(a.symbol, s0 - 45 * 24 * HOUR, e0)
         c5 = [c for c in c5 if c.t < e0 + 2 * 24 * HOUR]
-        stats, log = backtest(to_daily(c5, p.market), to_15m(c5), c5, p, start_ms=s0, end_ms=e0, warmup=a.warmup, fee_r=a.fee_r)
+        stats, log = backtest(to_daily(c5, p.market), to_h4(c5, p.market), to_15m(c5), c5, p, start_ms=s0, end_ms=e0, warmup=a.warmup, fee_r=a.fee_r)
         print(f"{a.symbol} {a.start}..{a.end} market={a.market} pip={p.pip} spread={p.spread_pips}p "
               f"killzones={p.market.killzones or 'off'} strict_body={p.strict_body} candles5m={len(c5)}")
         print_report(stats, log)
     elif a.cmd == "signal":
         now = int(time.time() * 1000)
-        st = day_state(get_broker(a), a.symbol, p, now)
-        if not st:
-            return print("no candle yet for today's session")
-        daily, c15, c5, ds, day_open = st
-        bias = daily_bias(daily, day_open)
-        print("votes:", daily_bias_votes(daily, day_open), "->", {BULL: "BULLISH", BEAR: "BEARISH", 0: "NEUTRAL"}[bias])
-        for su in find_setups(c15, c5, ds, p.market.day_end(ds), bias, p):
+        daily, h4, c15, c5, ds = day_state(get_broker(a), a.symbol, p, now)
+        lk = lock_bias(daily, h4, c5, ds, p) if now >= p.market.lock_time(ds) else None
+        if not lk:
+            return print("bias not locked yet (before the lock time or no price at lock)")
+        print("votes:", lk[1], "->", BIAS_NAME[lk[0]])
+        for su in find_setups(c15, c5, ds, p.market.day_end(ds), lk[0], p, after=lk[2]):
             print(su)
     else:
         run_live(a)

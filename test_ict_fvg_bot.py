@@ -123,6 +123,30 @@ class Tests(unittest.TestCase):
         self.assertAlmostEqual(p.buffer(1.1), 0.0002)
         self.assertAlmostEqual(p.min_risk(), 0.0005)
 
+    def test_lock_time_and_h4(self):
+        u = lambda *a: int(datetime(*a, tzinfo=UTC).timestamp() * 1000)
+        self.assertEqual(FOREX.lock_time(u(2026, 1, 11, 22)), u(2026, 1, 12, 7))      # 02:00 EST
+        self.assertEqual(FOREX.lock_time(u(2026, 7, 13, 21)), u(2026, 7, 14, 6))      # 02:00 EDT
+        c5 = [C(u(2026, 1, 11, 22) + k * 5 * MIN, 1, 2, 0.5, 1.5) for k in range(96)]  # 8h
+        h4 = to_h4(c5, FOREX)
+        self.assertEqual([c.t for c in h4], [u(2026, 1, 11, 22), u(2026, 1, 12, 2)])
+
+    def test_lock_bias_has_no_lookahead(self):
+        u = lambda *a: int(datetime(*a, tzinfo=UTC).timestamp() * 1000)
+        ds = u(2026, 1, 11, 22)
+        # 12 prior days with ranges 1.00-1.10, then today
+        daily = [C(ds - (12 - k) * DAY, 1.05, 1.10, 1.00, 1.05) for k in range(12)]
+        c5 = [C(ds + k * 5 * MIN, 1.05, 1.06, 1.04, 1.05) for k in range(12 * 9 + 1)]   # up to lock + 5m
+        h4 = to_h4(c5, FOREX)
+        p = Params(market=FOREX)
+        before = lock_bias(daily, h4, c5, ds, p)
+        lock_t = FOREX.lock_time(ds)
+        # rewrite everything at/after the lock with a huge spike: result must not change
+        c5b = [c if c.t < lock_t else C(c.t, 9, 9, 9, 9) for c in c5]
+        after = lock_bias(daily, to_h4(c5b, FOREX), c5b, ds, p)
+        self.assertEqual(before[:2], after[:2])
+        self.assertEqual(before[1]["A_pdh_pdl"], 0)                    # price 1.05 inside yesterday's range
+
 
 if __name__ == "__main__":
     unittest.main()
