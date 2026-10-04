@@ -313,10 +313,19 @@ def vote_sweep(d, lookback=5):
 
 # Votes take (daily history, 4H history, price at lock). COMBINED are the methods summed for the bias;
 # B_structure_1d is reported for comparison only.
+def vote_trend(d, price, n=20):
+    """D. Price above the n-day simple average of daily closes +1, below -1 (needs n completed days)."""
+    if len(d) < n:
+        return 0
+    ma = sum(c.c for c in d[-n:]) / n
+    return BULL if price > ma else BEAR if price < ma else 0
+
+
 METHODS = {"A_pdh_pdl": lambda d, h, p: vote_pdh_pdl(d, p),
            "B_structure_4h": lambda d, h, p: vote_structure(h),
            "B_structure_1d": lambda d, h, p: vote_structure(d),
-           "C_sweep": lambda d, h, p: vote_sweep(d)}
+           "C_sweep": lambda d, h, p: vote_sweep(d),
+           "D_sma20": lambda d, h, p: vote_trend(d, p)}
 COMBINED = ("A_pdh_pdl", "B_structure_4h", "C_sweep")
 
 
@@ -472,7 +481,8 @@ def backtest(daily, h4, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.
     'dir acc' = did price move in the bias direction from the lock price to the day's close.
     """
     variants = list(METHODS) + ["combined"]
-    stats = {v: dict(bias_days=0, bias_right=0, trades=0, wins=0, r=0.0) for v in variants}
+    gated = [v + "+sma20" for v in variants if v != "D_sma20"]      # bias kept only if it agrees with the trend
+    stats = {v: dict(bias_days=0, bias_right=0, trades=0, wins=0, r=0.0) for v in variants + gated}
     log, t5 = [], [c.t for c in c5]
     for i in range(warmup, len(daily)):
         today = daily[i]
@@ -487,6 +497,9 @@ def backtest(daily, h4, c15, c5, p, start_ms=0, end_ms=None, warmup=12, fee_r=0.
         actual = BULL if today.c > c5[j].c else BEAR
         biases = dict(votes, combined=comb)
         for v in variants:
+            if v != "D_sma20":
+                biases[v + "+sma20"] = biases[v] if biases[v] == votes["D_sma20"] else 0
+        for v in variants + gated:
             b, s = biases[v], stats[v]
             if b == 0:
                 continue
